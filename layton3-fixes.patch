@@ -1,0 +1,507 @@
+--- a/loader/main.c
++++ b/loader/main.c
+@@ -294,18 +294,109 @@
+ 	return fake_env;
+ }
+ 
++// Small cache of open asset file descriptors: the game calls FS_LoadFile very often
++// (often for the same files), and opening/closing a file on the memory card is expensive.
++// sceIoPread() doesn't touch the file position, so a descriptor can be shared by threads.
++#define FS_ASSET_DIR "ux0:data/layton_future/assets/"
++#define FS_CACHE_SIZE 8
++
++typedef struct {
++	char name[192];
++	SceUID fd;
++	int users;
++	uint32_t stamp;
++	uint8_t used;
++} fs_cache_entry;
++
++static fs_cache_entry fs_cache[FS_CACHE_SIZE];
++static pthread_mutex_t fs_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
++static uint32_t fs_cache_clock = 0;
++
++// Returns a file descriptor (or < 0 on error). *slot is the cache slot, or -1 if the
++// descriptor is not cached and must be closed by the caller.
++static SceUID fs_acquire(const char *full_fname, int *slot) {
++	*slot = -1;
++	if (strlen(full_fname) >= sizeof(fs_cache[0].name))
++		return sceIoOpen(full_fname, SCE_O_RDONLY, 0);
++
++	pthread_mutex_lock(&fs_cache_mutex);
++	int free_idx = -1, lru_idx = -1;
++	for (int i = 0; i < FS_CACHE_SIZE; i++) {
++		fs_cache_entry *e = &fs_cache[i];
++		if (e->used) {
++			if (!strcmp(e->name, full_fname)) {
++				e->users++;
++				e->stamp = ++fs_cache_clock;
++				SceUID fd = e->fd;
++				pthread_mutex_unlock(&fs_cache_mutex);
++				*slot = i;
++				return fd;
++			}
++			if (e->users == 0 && (lru_idx < 0 || e->stamp < fs_cache[lru_idx].stamp))
++				lru_idx = i;
++		} else if (free_idx < 0) {
++			free_idx = i;
++		}
++	}
++
++	SceUID fd = sceIoOpen(full_fname, SCE_O_RDONLY, 0);
++	if (fd < 0) {
++		pthread_mutex_unlock(&fs_cache_mutex);
++		return fd;
++	}
++
++	int idx = free_idx >= 0 ? free_idx : lru_idx;
++	if (idx < 0) { // Every slot is in use right now: just don't cache this one
++		pthread_mutex_unlock(&fs_cache_mutex);
++		return fd;
++	}
++
++	fs_cache_entry *e = &fs_cache[idx];
++	if (e->used)
++		sceIoClose(e->fd);
++	strcpy(e->name, full_fname);
++	e->fd = fd;
++	e->users = 1;
++	e->stamp = ++fs_cache_clock;
++	e->used = 1;
++	pthread_mutex_unlock(&fs_cache_mutex);
++	*slot = idx;
++	return fd;
++}
++
++static void fs_release(SceUID fd, int slot) {
++	if (slot < 0) {
++		sceIoClose(fd);
++		return;
++	}
++	pthread_mutex_lock(&fs_cache_mutex);
++	fs_cache[slot].users--;
++	pthread_mutex_unlock(&fs_cache_mutex);
++}
++
+ uint8_t FS_LoadFile(char *buf, const char *fname, int pos, int size) {
+ 	char full_fname[256];
+-	sprintf(full_fname, "ux0:data/layton_future/assets/%s", fname);
++	snprintf(full_fname, sizeof(full_fname), FS_ASSET_DIR "%s", fname);
+ 	//printf("FS_LoadFile %s\n", full_fname);
+-	FILE *f = fopen(full_fname, "rb");
+-	if (f) {
+-		fseek(f, pos, SEEK_SET);
+-		fread(buf, 1, size, f);
+-		fclose(f);
+-		return 1;
+-	}
+-	return 0;
++#ifdef FS_PROFILE
++	uint64_t t0 = sceKernelGetProcessTimeWide();
++#endif
++	int slot;
++	SceUID fd = fs_acquire(full_fname, &slot);
++	if (fd < 0)
++		return 0;
++	int done = 0;
++	while (done < size) {
++		int r = sceIoPread(fd, buf + done, size - done, (SceOff)pos + done);
++		if (r <= 0)
++			break;
++		done += r;
++	}
++	fs_release(fd, slot);
++#ifdef FS_PROFILE
++	printf("FS_LoadFile %s: %d bytes in %llu us\n", fname, done, sceKernelGetProcessTimeWide() - t0);
++#endif
++	return 1;
+ }
+ 
+ int FS_GetLength(const char *fname) {
+@@ -481,20 +572,24 @@
+ 	return fclose(f);
+ }
+ 
+-size_t AAsset_getLength(FILE *f) {
+-	size_t p = ftell(f);
++static int64_t file_length(FILE *f) {
++	struct stat st;
++	if (fstat(fileno(f), &st) == 0)
++		return st.st_size;
++	// Fallback: seek to the end and back
++	long p = ftell(f);
+ 	fseek(f, 0, SEEK_END);
+-	size_t res = ftell(f);
++	long res = ftell(f);
+ 	fseek(f, p, SEEK_SET);
+ 	return res;
+ }
+ 
++size_t AAsset_getLength(FILE *f) {
++	return (size_t)file_length(f);
++}
++
+ uint64_t AAsset_getLength64(FILE *f) {
+-	size_t p = ftell(f);
+-	fseek(f, 0, SEEK_END);
+-	uint64_t res = ftell(f);
+-	fseek(f, p, SEEK_SET);
+-	return res;
++	return (uint64_t)file_length(f);
+ }
+ 
+ size_t AAsset_read(FILE *f, void *buf, size_t count) {
+@@ -1134,8 +1229,8 @@
+ 		size = va_arg(args, size_t);
+ 		sprintf(fname, "ux0:data/layton_future/assets/%s", file);
+ 		BitFlag_SetByOffset(game_data_ref, 453, force_landscape ? 0 : 1, NULL);
+-		video_open(fname, offs, size);
+-		has_movie = 1;
++		if (video_open(fname, offs, size))
++			has_movie = 1;
+ 		return 1;
+ 	case MO_GetState:
+ 		return has_movie;
+--- a/loader/player.c
++++ b/loader/player.c
+@@ -7,6 +7,10 @@
+ #define FB_ALIGNMENT 0x40000
+ #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+ 
++// If the player makes no progress (no new timestamp, no new frame) for this long,
++// the movie is considered stuck and gets closed so the game can continue.
++#define PLAYER_STALL_TIMEOUT_US 4000000
++
+ int audio_new;
+ int audio_port = -1;
+ int audio_len;
+@@ -14,11 +18,11 @@
+ int audio_mode;
+ 
+ uint32_t current_timestamp = 0xFFFFFFFF;
+-uint32_t current_tick = 0;
+-#define AVPLAYER_BUG_TIMEFRAME 500000
++uint32_t last_progress_tick = 0;
+ 
+ SceAvPlayerHandle movie_player;
+-SceUID audio_thid;
++SceUID audio_thid = -1;
++volatile int audio_run = 0;
+ int player_state = PLAYER_INACTIVE;
+ 
+ GLuint movie_frame[5] = {};
+@@ -26,8 +30,13 @@
+ SceGxmTexture *movie_tex[5];
+ uint8_t first_frame = 1;
+ 
+-off_t video_offs;
+-size_t video_fsize;
++// Per-movie data handed to sceAvPlayer through fileReplacement.objectPointer.
++// Keeping the buffer here (instead of in a global) means a late close callback
++// of an old player can never free the buffer of a newer one.
++typedef struct {
++	uint8_t *buf;
++	uint64_t size;
++} video_source;
+ 
+ void video_audio_init(void) {
+ 	// Check if we have an already available audio port
+@@ -52,12 +61,16 @@
+ 	}
+ }
+ 
++// The thread only ends when audio_run is cleared by video_close().
++// It must NOT end on its own just because the player is not (yet) active:
++// otherwise a thread that starts a bit too early exits immediately and the movie
++// plays without audio and without an audio clock to sync to.
+ int video_audio_thread(SceSize args, void *argp) {
+ 	SceAvPlayerFrameInfo frame;
+ 	sceClibMemset(&frame, 0, sizeof(SceAvPlayerFrameInfo));
+ 
+-	while (player_state != PLAYER_INACTIVE && sceAvPlayerIsActive(movie_player)) {
+-		if (sceAvPlayerGetAudioData(movie_player, &frame)) {
++	while (audio_run) {
++		if (sceAvPlayerIsActive(movie_player) && sceAvPlayerGetAudioData(movie_player, &frame)) {
+ 			sceAudioOutSetConfig(audio_port, 1024, frame.details.audio.sampleRate, frame.details.audio.channelCount == 1 ? SCE_AUDIO_OUT_MODE_MONO : SCE_AUDIO_OUT_MODE_STEREO);
+ 			sceAudioOutOutput(audio_port, frame.pData);
+ 		} else {
+@@ -65,30 +78,35 @@
+ 		}
+ 	}
+ 
+-	return sceKernelExitDeleteThread(0);
++	return 0;
+ }
+ 
+-uint8_t *vid_buf;
+-FILE *vid_handle;
+ int video_start(void *argp, const char *fname) {
+ 	return 0;
+ }
+ 
+ int video_stop(void *argp) {
+-	free(vid_buf);
++	video_source *src = (video_source *)argp;
++	if (src) {
++		free(src->buf);
++		free(src);
++	}
+ 	return 0;
+ }
+ 
+ int video_read(void *argp, uint8_t *buffer, uint64_t pos, uint32_t len) {
+-	if (pos + len > video_fsize) {
+-		len = video_fsize - pos;
+-	}
+-	sceClibMemcpy(buffer, &vid_buf[pos], len);
++	video_source *src = (video_source *)argp;
++	if (!src || pos >= src->size)
++		return 0;
++	if (pos + len > src->size)
++		len = src->size - pos;
++	sceClibMemcpy(buffer, &src->buf[pos], len);
+ 	return len;
+ }
+ 
+ long long unsigned int video_size(void *argp) {
+-	return video_fsize;
++	video_source *src = (video_source *)argp;
++	return src ? src->size : 0;
+ }
+ 
+ void *mem_alloc(void *p, uint32_t align, uint32_t size) {
+@@ -106,6 +124,8 @@
+ 	size = ALIGN_MEM(size, align);
+ 	size = ALIGN_MEM(size, 1024 * 1024);
+ 	SceUID memblock = sceKernelAllocMemBlock("Video Memblock", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, size, NULL);
++	if (memblock < 0)
++		return NULL;
+ 
+ 	void *res;
+ 	sceKernelGetMemBlockBase(memblock, &res);
+@@ -123,26 +143,63 @@
+ 
+ extern uint8_t has_movie;
+ void video_close() {
+-	if (player_state == PLAYER_ACTIVE) {
++	if (player_state != PLAYER_INACTIVE) { // ACTIVE *and* PAUSED
++		// Stop and join the audio thread first, so it never touches a closed player
++		// and can never survive into the next movie.
++		audio_run = 0;
++		if (audio_thid >= 0) {
++			sceKernelWaitThreadEnd(audio_thid, NULL, NULL);
++			sceKernelDeleteThread(audio_thid);
++			audio_thid = -1;
++		}
++
+ 		sceAvPlayerStop(movie_player);
+ 		sceAvPlayerClose(movie_player);
+ 		player_state = PLAYER_INACTIVE;
+-		has_movie = 0;
++
++		// We borrowed the game's audio port: give it back as we found it
++		if (!audio_new && audio_port >= 0)
++			sceAudioOutSetConfig(audio_port, audio_len, audio_freq, audio_mode);
+ 	}
++	has_movie = 0;
+ }
+ 
+-void video_open(const char *path, off_t offs, size_t size) {
+-	if (player_state == PLAYER_ACTIVE) {
++// Returns 1 on success, 0 if the movie could not be opened.
++int video_open(const char *path, off_t offs, size_t size) {
++	if (player_state != PLAYER_INACTIVE) {
+ 		video_close();
+ 	}
+-	
+-	video_offs = offs;
+-	video_fsize = size;
++
+ 	current_timestamp = 0xFFFFFFFF;
+-	
++
++	// Load the whole movie into RAM
++	video_source *src = (video_source *)malloc(sizeof(video_source));
++	if (!src)
++		return 0;
++	src->buf = (uint8_t *)malloc(size);
++	if (!src->buf) {
++		free(src);
++		return 0;
++	}
++	FILE *vid_handle = fopen("ux0:data/layton_future/data/main.obb", "rb");
++	if (!vid_handle) {
++		free(src->buf);
++		free(src);
++		return 0;
++	}
++	fseek(vid_handle, offs, SEEK_SET);
++	size_t rd = fread(src->buf, 1, size, vid_handle);
++	fclose(vid_handle);
++	if (rd == 0) {
++		free(src->buf);
++		free(src);
++		return 0;
++	}
++	src->size = rd;
++
+ 	if (audio_port == -1)
+ 		video_audio_init();
+-	
++
+ 	first_frame = 1;
+ 	if (movie_frame[0] == 0) {
+ 		glGenTextures(5, movie_frame);
+@@ -153,7 +210,7 @@
+ 			vglFree(vglGetTexDataPointer(GL_TEXTURE_2D));
+ 		}
+ 	}
+-	
++
+ 	SceAvPlayerInitData playerInit;
+ 	memset(&playerInit, 0, sizeof(SceAvPlayerInitData));
+ 
+@@ -161,12 +218,12 @@
+ 	playerInit.memoryReplacement.deallocate = mem_free;
+ 	playerInit.memoryReplacement.allocateTexture = gpu_alloc;
+ 	playerInit.memoryReplacement.deallocateTexture = gpu_free;
+-	
+-	playerInit.fileReplacement.objectPointer = NULL;
++
++	playerInit.fileReplacement.objectPointer = src;
+ 	playerInit.fileReplacement.open = video_start;
+ 	playerInit.fileReplacement.close = video_stop;
+ 	playerInit.fileReplacement.readOffset = video_read;
+-	playerInit.fileReplacement.size = video_size; 
++	playerInit.fileReplacement.size = video_size;
+ 
+ 	playerInit.basePriority = 175;
+ 	playerInit.numOutputVideoFrameBuffers = 5;
+@@ -175,19 +232,26 @@
+ 	playerInit.debugLevel = 3;
+ #endif
+ 
+-	vid_buf = (uint8_t *)malloc(video_fsize);
+-	vid_handle = fopen("ux0:data/layton_future/data/main.obb", "rb");
+-	fseek(vid_handle, video_offs, SEEK_SET);
+-	fread(vid_buf, 1, video_fsize, vid_handle);
+-	fclose(vid_handle);
+-
+ 	movie_player = sceAvPlayerInit(&playerInit);
++	if (!movie_player) {
++		free(src->buf);
++		free(src);
++		return 0;
++	}
+ 	sceAvPlayerAddSource(movie_player, "dummy.mp4");
+-	
+-	audio_thid = sceKernelCreateThread("video_audio_thread", video_audio_thread, 0x10000100 - 10, 0x4000, 0, 0, NULL);
+-	sceKernelStartThread(audio_thid, 0, NULL);
+-	
++
++	// Everything the audio thread depends on must be set BEFORE the thread starts
++	last_progress_tick = sceKernelGetProcessTimeLow();
+ 	player_state = PLAYER_ACTIVE;
++	audio_run = 1;
++
++	audio_thid = sceKernelCreateThread("video_audio_thread", video_audio_thread, 0x10000100 - 10, 0x4000, 0, 0, NULL);
++	if (audio_thid >= 0)
++		sceKernelStartThread(audio_thid, 0, NULL);
++	else
++		audio_run = 0;
++
++	return 1;
+ }
+ 
+ uint32_t video_get_current_time() {
+@@ -198,16 +262,12 @@
+ 
+ GLuint video_get_frame(int *width, int *height) {
+ 	if (player_state == PLAYER_ACTIVE) {
++		uint32_t now = sceKernelGetProcessTimeLow();
+ 		if (sceAvPlayerIsActive(movie_player)) {
+ 			uint32_t cur_time = sceAvPlayerCurrentTime(movie_player);
+ 			if (cur_time != current_timestamp) {
+ 				current_timestamp = cur_time;
+-			} else {
+-				uint32_t tick = sceKernelGetProcessTimeLow();
+-				if (tick - current_tick > AVPLAYER_BUG_TIMEFRAME) {
+-					printf("ERROR: Lock Bug Detected on time %u\n", current_timestamp);
+-				}
+-				current_tick = tick;
++				last_progress_tick = now;
+ 			}
+ 			SceAvPlayerFrameInfo frame;
+ 			if (sceAvPlayerGetVideoData(movie_player, &frame)) {
+@@ -223,38 +283,54 @@
+ 				sceGxmTextureSetMinFilter(movie_tex[movie_frame_idx], SCE_GXM_TEXTURE_FILTER_LINEAR);
+ 				sceGxmTextureSetMagFilter(movie_tex[movie_frame_idx], SCE_GXM_TEXTURE_FILTER_LINEAR);
+ 				first_frame = 0;
++				last_progress_tick = now;
++			}
++			// Watchdog: sceAvPlayer sometimes locks up. Give up instead of freezing forever.
++			if (now - last_progress_tick > PLAYER_STALL_TIMEOUT_US) {
++				printf("ERROR: Lock Bug Detected on time %u, closing movie\n", current_timestamp);
++				video_close();
++				return 0xDEADBEEF;
+ 			}
+ 			return first_frame ? 0xDEADBEEF : movie_frame[movie_frame_idx];
+-		} else if (!first_frame)
++		} else if (!first_frame || now - last_progress_tick > PLAYER_STALL_TIMEOUT_US) {
++			// Movie ended, or it never even started
+ 			video_close();
++		}
+ 	} else if (player_state == PLAYER_PAUSED) {
+ 		return movie_frame[movie_frame_idx];
+ 	}
+-	
++
+ 	return 0xDEADBEEF;
+ }
+ 
+ void video_pause() {
++	if (player_state != PLAYER_ACTIVE)
++		return;
+ 	sceAvPlayerPause(movie_player);
+ 	player_state = PLAYER_PAUSED;
+ }
+ 
+ void video_resume() {
++	if (player_state != PLAYER_PAUSED)
++		return;
+ 	sceAvPlayerResume(movie_player);
+ 	player_state = PLAYER_ACTIVE;
+-	current_tick = sceKernelGetProcessTimeLow();
++	last_progress_tick = sceKernelGetProcessTimeLow();
+ }
+ 
+ void video_set_volume(float vol) {
++	if (audio_port < 0)
++		return;
+ 	int vols[2] = {(int)(vol * 32767.0f), (int)(vol * 32767.0f)};
+ 	sceAudioOutSetVolume(audio_port, SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH, vols);
+ }
+ 
+ void video_jump_to_time(uint64_t time) {
+-	if (player_state == PLAYER_ACTIVE) { 
++	if (player_state == PLAYER_ACTIVE) {
+ 		uint64_t old_time = sceAvPlayerCurrentTime(movie_player);
+ 		sceAvPlayerJumpToTime(movie_player, time);
+-		while (sceAvPlayerCurrentTime(movie_player) == old_time) { // Wait for sceAvPlayer FileStream thread response after jump finished
++		// Wait for sceAvPlayer FileStream thread response after jump finished (max ~2s)
++		for (int i = 0; i < 2000 && sceAvPlayerCurrentTime(movie_player) == old_time; i++) {
+ 			sceKernelDelayThread(1000);
+ 		}
+ 	}
+--- a/loader/player.h
++++ b/loader/player.h
+@@ -15,7 +15,7 @@
+ 
+ extern int player_state;
+ 
+-void video_open(const char *path, off_t offs, size_t size);
++int video_open(const char *path, off_t offs, size_t size);
+ GLuint video_get_frame(int *width, int *height);
+ uint32_t video_get_current_time();
+ void video_close();
